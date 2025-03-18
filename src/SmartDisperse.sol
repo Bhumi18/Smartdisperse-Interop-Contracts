@@ -3,41 +3,60 @@ pragma solidity ^0.8.25;
 
 import {IL2ToL2CrossDomainMessenger} from "@contracts-bedrock/L2/interfaces/IL2ToL2CrossDomainMessenger.sol";
 import {ISuperchainERC20} from "optimism/packages/contracts-bedrock/src/L2/interfaces/ISuperchainERC20.sol";
+import {ISuperchainWETH} from "optimism/packages/contracts-bedrock/src/L2/interfaces/ISuperchainWETH.sol";
 import {Predeploys} from "@contracts-bedrock/libraries/Predeploys.sol";
 import {ISuperchainTokenBridge} from "optimism/packages/contracts-bedrock/src/L2/interfaces/ISuperchainTokenBridge.sol";
 import {ReentrancyGuard} from "optimism/packages/contracts-bedrock/lib/openzeppelin-contracts/contracts/security/ReentrancyGuard.sol";
+import {Ownable} from "optimism/packages/contracts-bedrock/lib/openzeppelin-contracts/contracts/access/Ownable.sol";
 
+// Custom error definitions for better gas efficiency
 error CallerNotL2ToL2CrossDomainMessenger();
 error InvalidCrossDomainSender();
 error InvalidAmount();
 error TransferFailed();
+error InvalidArrayLength();
 
-contract SmartDisperse is ReentrancyGuard {
-    /// @notice Structure to hold transfer details
+contract SmartDisperse is ReentrancyGuard, Ownable {
+    /// @notice Structure to hold transfer details for cross-chain token distribution
     struct TransferMessage {
+        address[] recipients; // Addresses of the recipients
+        uint256[] amounts; // Amounts to be sent to each recipient
+        address tokenAddress; // Address of the token being transferred
+        uint256 totalAmount; // Total amount of tokens to be distributed
+    }
+
+    struct CrossChainTransfer {
+        uint256 chainId;
         address[] recipients;
         uint256[] amounts;
-        address tokenAddress;
-        uint256 totalAmount;
     }
 
     /*******************************     EVENTS      ***********************************/
 
-    event TokensSent(
+    event NativeTokensSent(
         uint256 indexed fromChainId,
         uint256 indexed toChainId,
         uint256 totalAmount
     );
+
+    event ERC20TokensSent(
+        uint256 indexed fromChainId,
+        uint256 indexed toChainId,
+        uint256 totalAmount
+    );
+
     event TokensReceived(
         uint256 indexed fromChainId,
         uint256 indexed toChainId,
         uint256 totalAmount
     );
+
     event NativeTokensDispersed(
         address indexed sender,
         address[] indexed recipients,
         uint256[] values
     );
+
     event TokensDispersed(
         address indexed sender,
         address[] indexed recipients,
@@ -58,26 +77,26 @@ contract SmartDisperse is ReentrancyGuard {
         _;
     }
 
-    // function disperseSameChain(address[] calldata _recipients)
+    /*******************************     SAME-CHAIN TRANSFER FUNCTIONS      ******************************/
 
     /**
      * @notice Transfers Native tokens (ETH) to multiple recipients on the same chain
-     * @param recipients The array of addresses to recieve the native tokens
-     * @param values The corresponding amounts of native tokens to transfer to each recipients
+     * @param _recipients The array of addresses to receive the native tokens
+     * @param _amounts The corresponding amounts of native tokens to transfer to each recipient
      */
     function disperseNative(
-        address[] memory recipients,
-        uint256[] memory values
+        address[] memory _recipients,
+        uint256[] memory _amounts
     ) external payable nonReentrant {
-        require(recipients.length == values.length, "Mismatched array length");
+        if (_recipients.length != _amounts.length) revert InvalidArrayLength();
 
         uint256 requiredAmount = 0;
 
-        for (uint256 i = 0; i < values.length; i++) {
-            requiredAmount += values[i];
+        for (uint256 i = 0; i < _amounts.length; i++) {
+            requiredAmount += _amounts[i];
         }
 
-        require(msg.value >= requiredAmount, "Insufficient ETH sent");
+        if (msg.value < requiredAmount) revert InvalidAmount();
 
         // Refund any excess ETH
         uint256 refund = msg.value - requiredAmount;
@@ -85,31 +104,30 @@ contract SmartDisperse is ReentrancyGuard {
             payable(msg.sender).transfer(refund);
         }
 
-        for (uint256 i = 0; i < recipients.length; i++) {
-            (bool success, ) = recipients[i].call{value: values[i]}("");
+        for (uint256 i = 0; i < _recipients.length; i++) {
+            (bool success, ) = _recipients[i].call{value: _amounts[i]}("");
             require(success, "Transfer failed to recipient");
         }
 
-        emit NativeTokensDispersed(msg.sender, recipients, values);
+        emit NativeTokensDispersed(msg.sender, _recipients, _amounts);
     }
 
     /**
      * @notice Transfers ISuperchainERC20 tokens to multiple recipients on the same chain
-     * @param recipients The array of addresses to recieve the tokens
-     * @param values The corresponding amounts of tokens to transfer to each recipients
+     * @param _recipients The array of addresses to receive the tokens
+     * @param _amounts The corresponding amounts of tokens to transfer to each recipient
      * @param token The address of the token to be transferred
      */
-
-    function disperseTokens(
-        address[] memory recipients,
-        uint256[] memory values,
+    function disperseERC20(
+        address[] memory _recipients,
+        uint256[] memory _amounts,
         address token
     ) external nonReentrant {
-        require(recipients.length == values.length, "Mismatched array length");
+        if (_recipients.length != _amounts.length) revert InvalidArrayLength();
 
         uint256 totalAmount = 0;
-        for (uint256 i = 0; i < values.length; i++) {
-            totalAmount += values[i];
+        for (uint256 i = 0; i < _amounts.length; i++) {
+            totalAmount += _amounts[i];
         }
 
         bool success = ISuperchainERC20(token).transferFrom(
@@ -119,33 +137,97 @@ contract SmartDisperse is ReentrancyGuard {
         );
         require(success, "TransferFrom failed");
 
-        for (uint256 i = 0; i < recipients.length; i++) {
+        for (uint256 i = 0; i < _recipients.length; i++) {
             success = ISuperchainERC20(token).transfer(
-                recipients[i],
-                values[i]
+                _recipients[i],
+                _amounts[i]
             );
-            if (!success) revert TransferFailed();
+            require(
+                success,
+                string(
+                    abi.encodePacked(
+                        "Transfer failed for address: ",
+                        _recipients[i]
+                    )
+                )
+            );
         }
-        emit TokensDispersed(msg.sender, recipients, values, token);
+        emit TokensDispersed(msg.sender, _recipients, _amounts, token);
+    }
+
+    /*******************************    CROSS-CHAIN TRANSFER FUNCTIONS      ***********************************/
+
+    /**
+     * @notice Transfers Native tokens to multiple recipients on another chain
+     * @param _toChainId The destination chain ID
+     * @param _recipients Array of recipient addresses
+     * @param _amounts Array of amounts for each recipient
+     */
+    function crossChainDisperseNative(
+        uint256 _toChainId,
+        address[] calldata _recipients,
+        uint256[] calldata _amounts
+    ) external payable {
+        if (_recipients.length != _amounts.length) revert InvalidArrayLength();
+
+        uint256 totalAmount = 0;
+        for (uint256 i = 0; i < _amounts.length; i++) {
+            totalAmount += _amounts[i];
+        }
+
+        if (msg.value < totalAmount) revert InvalidAmount();
+
+        // Wrap ETH to WETH
+        ISuperchainWETH(payable(Predeploys.SUPERCHAIN_WETH)).deposit{
+            value: totalAmount
+        }();
+
+        // Send the Token to the bridge for cross-chain transfer
+        ISuperchainTokenBridge(Predeploys.SUPERCHAIN_TOKEN_BRIDGE).sendERC20(
+            Predeploys.SUPERCHAIN_WETH,
+            address(this),
+            totalAmount,
+            _toChainId
+        );
+
+        // Create transfer message for recipients
+        TransferMessage memory message = TransferMessage({
+            recipients: _recipients,
+            amounts: _amounts,
+            tokenAddress: Predeploys.SUPERCHAIN_WETH,
+            totalAmount: totalAmount
+        });
+
+        // Send message to destination chain
+        messenger.sendMessage(
+            _toChainId,
+            address(this),
+            abi.encodeCall(this.receiveTokens, (message))
+        );
+
+        // Refund any excess ETH
+        uint256 refund = msg.value - totalAmount;
+        if (refund > 0) {
+            payable(msg.sender).transfer(refund);
+        }
+
+        emit NativeTokensSent(block.chainid, _toChainId, totalAmount);
     }
 
     /**
-     * @notice Transfers tokens to multiple recipients on another chain
+     * @notice Transfers SuperchainERC20 tokens to multiple recipients on another chain
      * @param _toChainId The destination chain ID
      * @param _recipients Array of recipient addresses
      * @param _amounts Array of amounts for each recipient
      * @param _token Address of the ERC20 token
      */
-    function transferTokensTo(
+    function crossChainDisperseERC20(
         uint256 _toChainId,
         address[] calldata _recipients,
         uint256[] calldata _amounts,
         address _token
     ) external {
-        require(
-            _recipients.length == _amounts.length,
-            "Arrays length mismatch"
-        );
+        if (_recipients.length != _amounts.length) revert InvalidArrayLength();
 
         uint256 totalAmount = 0;
         for (uint256 i = 0; i < _amounts.length; i++) {
@@ -158,9 +240,9 @@ contract SmartDisperse is ReentrancyGuard {
             address(this),
             totalAmount
         );
-        if (!success) revert TransferFailed();
+        require(success, "TransferFrom failed");
 
-        // Firstly, Send the Token
+        // Send the Token to the bridge for cross-chain transfer
         ISuperchainTokenBridge(Predeploys.SUPERCHAIN_TOKEN_BRIDGE).sendERC20(
             _token,
             address(this),
@@ -168,7 +250,7 @@ contract SmartDisperse is ReentrancyGuard {
             _toChainId
         );
 
-        // Create transfer message
+        // Create transfer message for recipients
         TransferMessage memory message = TransferMessage({
             recipients: _recipients,
             amounts: _amounts,
@@ -183,8 +265,76 @@ contract SmartDisperse is ReentrancyGuard {
             abi.encodeCall(this.receiveTokens, (message))
         );
 
-        emit TokensSent(block.chainid, _toChainId, totalAmount);
+        emit ERC20TokensSent(block.chainid, _toChainId, totalAmount);
     }
+
+    function crossChainDisperseNativeMultiChain(
+        CrossChainTransfer[] calldata transfers
+    ) external payable {
+        uint256 totalAmount = _validateAndCalculateTotal(transfers);
+
+        if (msg.value < totalAmount) revert InvalidAmount();
+
+        ISuperchainWETH(payable(Predeploys.SUPERCHAIN_WETH)).deposit{
+            value: totalAmount
+        }();
+
+        for (uint256 i = 0; i < transfers.length; i++) {
+            _processTransfer(transfers[i], Predeploys.SUPERCHAIN_WETH);
+        }
+
+        uint256 refund = msg.value - totalAmount;
+        if (refund > 0) {
+            payable(msg.sender).transfer(refund);
+        }
+    }
+
+    function _validateAndCalculateTotal(
+        CrossChainTransfer[] calldata transfers
+    ) internal pure returns (uint256 totalAmount) {
+        for (uint256 i = 0; i < transfers.length; i++) {
+            if (transfers[i].recipients.length != transfers[i].amounts.length)
+                revert InvalidArrayLength();
+
+            for (uint256 j = 0; j < transfers[i].amounts.length; j++) {
+                totalAmount += transfers[i].amounts[j];
+            }
+        }
+    }
+
+    function _processTransfer(
+        CrossChainTransfer calldata transfer,
+        address _token
+    ) internal {
+        uint256 chainTotal = 0;
+        for (uint256 j = 0; j < transfer.amounts.length; j++) {
+            chainTotal += transfer.amounts[j];
+        }
+
+        ISuperchainTokenBridge(Predeploys.SUPERCHAIN_TOKEN_BRIDGE).sendERC20(
+            _token,
+            address(this),
+            chainTotal,
+            transfer.chainId
+        );
+
+        TransferMessage memory message = TransferMessage({
+            recipients: transfer.recipients,
+            amounts: transfer.amounts,
+            tokenAddress: _token,
+            totalAmount: chainTotal
+        });
+
+        messenger.sendMessage(
+            transfer.chainId,
+            address(this),
+            abi.encodeCall(this.receiveTokens, (message))
+        );
+
+        emit NativeTokensSent(block.chainid, transfer.chainId, chainTotal);
+    }
+
+    /*******************************     DESTINATION CHAIN EXECUTION      ***********************************/
 
     /**
      * @notice Receives tokens and distributes them to recipients
@@ -203,16 +353,40 @@ contract SmartDisperse is ReentrancyGuard {
                 _message.recipients[i],
                 _message.amounts[i]
             );
-            if (!success) revert TransferFailed();
+            require(success, "Transfer failed");
         }
 
-        // Verify total amount matches
-        if (verifyTotal != _message.totalAmount) revert InvalidAmount();
+        // Verify total amount matches the expected total require(verifyTotal == _message.totalAmount, "Invalid amount");
 
         emit TokensReceived(
             messenger.crossDomainMessageSource(),
             block.chainid,
             _message.totalAmount
         );
+    }
+
+    /*******************************     WITHDRAW FUNCTIONS      ***********************************/
+
+    /**
+     * @notice Withdraw any native tokens (ETH) left in the contract
+     * @param _to The address to send the withdrawn funds to
+     */
+    function withdrawNative(address payable _to) external onlyOwner {
+        uint256 balance = address(this).balance;
+        if (balance == 0) revert InvalidAmount();
+        (bool success, ) = _to.call{value: balance}("");
+        if (!success) revert TransferFailed();
+    }
+
+    /**
+     * @notice Withdraw any ERC20 tokens left in the contract
+     * @param _token The address of the ERC20 token to withdraw
+     * @param _to The address to send the withdrawn funds to
+     */
+    function withdrawERC20(address _token, address _to) external onlyOwner {
+        uint256 balance = ISuperchainERC20(_token).balanceOf(address(this));
+        if (balance == 0) revert InvalidAmount();
+        bool success = ISuperchainERC20(_token).transfer(_to, balance);
+        if (!success) revert TransferFailed();
     }
 }
